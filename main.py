@@ -252,6 +252,84 @@ def products():
     return send_from_directory(APP_DIR, "products.json")
 
 
+# Сколько товаров отдавать за один запрос каталога по умолчанию / максимум.
+DEFAULT_PER_PAGE = 12
+MAX_PER_PAGE = 48
+
+
+@app.route("/api/filters", methods=["GET"])
+def api_filters():
+    """Полный список категорий и брендов — нужен, чтобы построить чипы
+    фильтров сразу, не дожидаясь подгрузки всех товаров постранично."""
+    items = load_products()
+    categories = sorted({(p.get("category") or "").strip() for p in items if (p.get("category") or "").strip()})
+    brands = sorted({(p.get("brand") or "").strip() for p in items if (p.get("brand") or "").strip()})
+    return jsonify({"categories": categories, "brands": brands})
+
+
+@app.route("/api/products", methods=["GET"])
+def api_products():
+    """Каталог товаров постранично, с фильтрами по категории/бренду и
+    сортировкой по цене. Если передан ids=1,2,3 — вернёт именно эти товары
+    целиком, без пагинации (используется для списка избранного)."""
+    items = load_products()
+
+    ids_raw = (request.args.get("ids") or "").strip()
+    if ids_raw:
+        try:
+            id_set = {int(x) for x in ids_raw.split(",") if x.strip()}
+        except ValueError:
+            id_set = set()
+        matched = [p for p in items if p.get("id") in id_set]
+        return jsonify({
+            "items": matched,
+            "page": 1,
+            "per_page": len(matched),
+            "total": len(matched),
+            "has_more": False,
+        })
+
+    category = (request.args.get("category") or "").strip()
+    brand = (request.args.get("brand") or "").strip()
+    sort = (request.args.get("sort") or "default").strip()
+
+    filtered = items
+    if category and category != "Все":
+        filtered = [p for p in filtered if (p.get("category") or "") == category]
+    if brand and brand != "Все":
+        filtered = [p for p in filtered if (p.get("brand") or "") == brand]
+
+    if sort == "price_asc":
+        filtered = sorted(filtered, key=lambda p: p.get("price") or 0)
+    elif sort == "price_desc":
+        filtered = sorted(filtered, key=lambda p: p.get("price") or 0, reverse=True)
+
+    try:
+        page = int(request.args.get("page", 1))
+    except (TypeError, ValueError):
+        page = 1
+    page = max(1, page)
+
+    try:
+        per_page = int(request.args.get("per_page", DEFAULT_PER_PAGE))
+    except (TypeError, ValueError):
+        per_page = DEFAULT_PER_PAGE
+    per_page = max(1, min(per_page, MAX_PER_PAGE))
+
+    total = len(filtered)
+    start = (page - 1) * per_page
+    end = start + per_page
+    page_items = filtered[start:end]
+
+    return jsonify({
+        "items": page_items,
+        "page": page,
+        "per_page": per_page,
+        "total": total,
+        "has_more": end < total,
+    })
+
+
 @app.route("/api/order", methods=["POST"])
 def create_order():
     data = request.get_json(force=True, silent=True) or {}

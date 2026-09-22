@@ -178,6 +178,13 @@
   .empty-state{grid-column:1/-1;text-align:center;padding:70px 20px;color:var(--muted);font-size:14px;line-height:1.6;}
   .empty-state svg{opacity:.4;margin-bottom:16px;animation:floatIcon 3s ease-in-out infinite;}
   @keyframes floatIcon{0%,100%{transform:translateY(0);}50%{transform:translateY(-8px);}}
+  .grid-loader{display:flex;align-items:center;justify-content:center;gap:6px;min-height:44px;padding:16px 0 26px;opacity:0;transition:opacity .25s;}
+  .grid-loader.active{opacity:1;}
+  .grid-loader.done{display:none;}
+  .grid-loader-dot{width:6px;height:6px;border-radius:50%;background:var(--accent-soft);opacity:.35;animation:loaderDot 1s ease-in-out infinite;}
+  .grid-loader-dot:nth-child(2){animation-delay:.15s;}
+  .grid-loader-dot:nth-child(3){animation-delay:.3s;}
+  @keyframes loaderDot{0%,80%,100%{opacity:.25;transform:scale(.85);}40%{opacity:1;transform:scale(1.15);}}
   .sheet{position:fixed;left:0;right:0;bottom:0;max-width:480px;margin:0 auto;background:linear-gradient(180deg,rgba(15,18,13,.98),rgba(8,10,7,.99));border-top:1px solid var(--line);border-radius:24px 24px 0 0;transform:translateY(100%);transition:transform .45s var(--ease-sheet);z-index:40;max-height:88vh;overflow-y:auto;box-shadow:0 -30px 80px rgba(0,0,0,.6);padding-bottom:var(--safe-b);touch-action:pan-y;}
   .sheet.dragging{transition:none;}
   .sheet.open{transform:translateY(0);}
@@ -418,6 +425,9 @@
   <div id="gridWrap">
     <div class="skeleton-grid" id="skeletonGrid"></div>
     <div class="grid" id="grid" style="display:none;"></div>
+    <div class="grid-loader" id="gridLoader">
+      <div class="grid-loader-dot"></div><div class="grid-loader-dot"></div><div class="grid-loader-dot"></div>
+    </div>
   </div>
 </div>
 
@@ -621,7 +631,12 @@ const firstImage = p => (p.images && p.images.length) ? p.images[0] : (p.image |
 const slideBg = (url, p) => url ? `background-image:url('${url}');background-size:cover;background-position:center;` : `background:${SWATCHES[p.swatch % SWATCHES.length]};`;
 const media = p => slideBg(firstImage(p), p);
 
-let PRODUCTS = [];
+let PRODUCTS = [];              // накопленный кэш всех когда-либо загруженных товаров (id -> данные), для избранного/корзины/карточки товара
+const PRODUCTS_MAP = new Map();
+function cacheProducts(items){
+  items.forEach(p => PRODUCTS_MAP.set(p.id, p));
+  PRODUCTS = [...PRODUCTS_MAP.values()];
+}
 let cart = [];
 let appliedPromo = null; // { code, type, value }
 let promoFormOpen = false;
@@ -629,6 +644,15 @@ let activeCategory = 'Все';
 let activeBrand = 'Все';
 let currentProduct = null;
 let sortMode = 'default';
+let ALL_CATEGORIES = [];
+let ALL_BRANDS = [];
+
+// --- постраничная подгрузка каталога -----------------------------------
+const PER_PAGE = 12;
+let gridPage = 1;
+let gridHasMore = true;
+let gridLoading = false;
+let gridRequestToken = 0; // чтобы отбросить устаревший ответ, если фильтр сменился быстрее, чем пришёл ответ
 
 // --- избранное (хранится локально на устройстве) -----------------------
 function loadFavorites(){
@@ -644,7 +668,7 @@ function isFav(id){ return favorites.has(id); }
 
 function toggleFavorite(id, opts){
   opts = opts || {};
-  const p = PRODUCTS.find(x=>x.id===id);
+  const p = PRODUCTS_MAP.get(id);
   const willAdd = !favorites.has(id);
   if (willAdd) favorites.add(id); else favorites.delete(id);
   saveFavorites();
@@ -676,6 +700,7 @@ const filtersEl = document.getElementById('filters');
 const brandFiltersEl = document.getElementById('brandFilters');
 const brandFiltersRow = document.getElementById('brandFiltersRow');
 const skeletonGrid = document.getElementById('skeletonGrid');
+const gridLoader = document.getElementById('gridLoader');
 
 function renderSkeleton(){
   skeletonGrid.innerHTML = Array.from({length:6}).map(()=>`
@@ -722,7 +747,7 @@ function renderTicker(){
 }
 
 function renderFilters(){
-  const cats = ['Все', ...new Set(PRODUCTS.map(p => p.category))];
+  const cats = ['Все', ...ALL_CATEGORIES];
   filtersEl.innerHTML = cats.map(c =>
     `<button class="chip ${c===activeCategory?'active':''}" data-cat="${c}">${c}</button>`
   ).join('');
@@ -737,14 +762,13 @@ function renderFilters(){
 }
 
 function renderBrandFilters(){
-  const brands = [...new Set(PRODUCTS.map(p => p.brand).filter(Boolean))];
-  if (brands.length === 0){
+  if (ALL_BRANDS.length === 0){
     brandFiltersRow.style.display = 'none';
     brandFiltersEl.innerHTML = '';
     return;
   }
   brandFiltersRow.style.display = 'flex';
-  const opts = ['Все', ...brands];
+  const opts = ['Все', ...ALL_BRANDS];
   brandFiltersEl.innerHTML = opts.map(b =>
     `<button class="chip ${b===activeBrand?'active':''}" data-brand="${b}">${b}</button>`
   ).join('');
@@ -806,7 +830,7 @@ function attachCardHandlers(container){
     btn.onclick = (e) => {
       e.stopPropagation();
       const card = btn.closest('.card');
-      const p = PRODUCTS.find(x=>x.id===Number(btn.dataset.id));
+      const p = PRODUCTS_MAP.get(Number(btn.dataset.id));
       const imgs = (p.images && p.images.length) ? p.images : (p.image ? [p.image] : []);
       if (!imgs.length) return;
       let idx = Number(card.dataset.imgIndex || 0);
@@ -817,13 +841,6 @@ function attachCardHandlers(container){
       card.querySelectorAll('.card-dot').forEach((d,di)=>d.classList.toggle('active', di===idx));
     };
   });
-}
-
-function applySort(list){
-  const sorted = list.slice();
-  if (sortMode==='price_asc') sorted.sort((a,b)=>a.price-b.price);
-  else if (sortMode==='price_desc') sorted.sort((a,b)=>b.price-a.price);
-  return sorted;
 }
 
 const sortBtn = document.getElementById('sortBtn');
@@ -845,36 +862,105 @@ sortMenu.querySelectorAll('.sort-opt').forEach(opt=>{
   };
 });
 
+// --- каталог: грузим товары порциями (по PER_PAGE штук), а не всё сразу -
+function buildProductsQuery(page){
+  const params = new URLSearchParams();
+  if (activeCategory !== 'Все') params.set('category', activeCategory);
+  if (activeBrand !== 'Все') params.set('brand', activeBrand);
+  if (sortMode !== 'default') params.set('sort', sortMode);
+  params.set('page', page);
+  params.set('per_page', PER_PAGE);
+  return params.toString();
+}
+
+let gridObserver = null;
+function ensureGridObserver(){
+  if (gridObserver) return;
+  gridObserver = new IntersectionObserver((entries)=>{
+    entries.forEach(entry=>{
+      if (entry.isIntersecting && gridHasMore && !gridLoading){
+        loadGridPage(gridRequestToken);
+      }
+    });
+  }, { root:null, rootMargin:'600px 0px', threshold:0 });
+  gridObserver.observe(gridLoader);
+}
+
+function loadGridPage(token){
+  if (gridLoading || !gridHasMore) return;
+  gridLoading = true;
+  gridLoader.classList.add('active');
+  fetch('/api/products?' + buildProductsQuery(gridPage))
+    .then(r => r.json())
+    .then(data => {
+      if (token !== gridRequestToken) return; // фильтр/сортировка сменились быстрее ответа — отбрасываем устаревшие данные
+      cacheProducts(data.items);
+      gridHasMore = !!data.has_more;
+      gridPage += 1;
+      if (gridPage === 2 && data.items.length === 0){
+        grid.innerHTML = emptyStateHTML;
+      } else {
+        const startIdx = grid.querySelectorAll('.card').length;
+        grid.insertAdjacentHTML('beforeend', data.items.map((p,i) => cardHTML(p, startIdx + i)).join(''));
+        attachCardHandlers(grid);
+      }
+      gridLoading = false;
+      gridLoader.classList.remove('active');
+      gridLoader.classList.toggle('done', !gridHasMore);
+      if (gridHasMore) ensureGridObserver();
+    })
+    .catch(()=>{
+      gridLoading = false;
+      gridLoader.classList.remove('active');
+      if (gridPage === 1) grid.innerHTML = emptyStateHTML;
+    });
+}
+
 function renderGrid(){
-  let list = activeCategory==='Все' ? PRODUCTS : PRODUCTS.filter(p=>p.category===activeCategory);
-  if (activeBrand !== 'Все') list = list.filter(p=>p.brand===activeBrand);
-  list = applySort(list);
+  const token = ++gridRequestToken;
+  gridPage = 1;
+  gridHasMore = true;
+  gridLoading = false;
+  gridLoader.classList.remove('done');
   grid.style.opacity = '0';
   grid.style.transform = 'translateY(6px)';
   setTimeout(()=>{
-    if (list.length===0){
-      grid.innerHTML = emptyStateHTML;
-    } else {
-      grid.innerHTML = list.map((p,i) => cardHTML(p,i)).join('');
-      attachCardHandlers(grid);
-    }
+    if (token !== gridRequestToken) return;
+    grid.innerHTML = '';
     grid.style.opacity = '1';
     grid.style.transform = 'translateY(0)';
+    loadGridPage(token);
   }, 140);
 }
 
 function renderFavorites(){
   const favGrid = document.getElementById('favGrid');
-  const list = PRODUCTS.filter(p=>favorites.has(p.id));
-  if (list.length===0){
-    favGrid.innerHTML = `<div class="favs-empty">
-      <svg width="38" height="38" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.3"><path d="M12 20.5s-7.6-4.6-10-9.1C.5 8 2 4.7 5.3 4.1c2-.4 3.9.5 5 2.2 1.1-1.7 3-2.6 5-2.2C18.6 4.7 20 8 19.6 9c-2 4.9-7.6 11.5-7.6 11.5Z"/></svg>
-      <div>Пока ничего не отмечено<br>Нажмите на сердечко у товара, чтобы сохранить его сюда</div>
-    </div>`;
-  } else {
-    favGrid.innerHTML = list.map((p,i) => cardHTML(p,i)).join('');
-    attachCardHandlers(favGrid);
+  const missingIds = [...favorites].filter(id => !PRODUCTS_MAP.has(id));
+
+  const doRender = () => {
+    const list = [...favorites].map(id => PRODUCTS_MAP.get(id)).filter(Boolean);
+    if (list.length===0){
+      favGrid.innerHTML = `<div class="favs-empty">
+        <svg width="38" height="38" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.3"><path d="M12 20.5s-7.6-4.6-10-9.1C.5 8 2 4.7 5.3 4.1c2-.4 3.9.5 5 2.2 1.1-1.7 3-2.6 5-2.2C18.6 4.7 20 8 19.6 9c-2 4.9-7.6 11.5-7.6 11.5Z"/></svg>
+        <div>Пока ничего не отмечено<br>Нажмите на сердечко у товара, чтобы сохранить его сюда</div>
+      </div>`;
+    } else {
+      favGrid.innerHTML = list.map((p,i) => cardHTML(p,i)).join('');
+      attachCardHandlers(favGrid);
+    }
+  };
+
+  if (missingIds.length === 0){
+    doRender();
+    return;
   }
+  fetch('/api/products?ids=' + missingIds.join(','))
+    .then(r => r.json())
+    .then(data => {
+      cacheProducts(data.items || []);
+      doRender();
+    })
+    .catch(doRender);
 }
 
 // --- product photo gallery: arrows + dots + swipe, smooth sliding ------
@@ -960,7 +1046,7 @@ document.getElementById('pdArrowR').onclick = (e) => { e.stopPropagation(); goTo
 })();
 
 function openProduct(id){
-  currentProduct = PRODUCTS.find(p=>p.id===id);
+  currentProduct = PRODUCTS_MAP.get(id);
   const p = currentProduct;
   renderGallery(p);
   document.getElementById('pdCat').textContent = p.category + (p.brand ? ' · ' + p.brand : '');
@@ -1548,14 +1634,15 @@ document.querySelectorAll('.sheet').forEach(sheet=>{
 
 updateFavBadge();
 
-fetch('products.json').then(r=>r.json()).then(data=>{
-  PRODUCTS = data;
+fetch('/api/filters').then(r=>r.json()).then(data=>{
+  ALL_CATEGORIES = data.categories || [];
+  ALL_BRANDS = data.brands || [];
   renderTicker();
   renderFilters();
   renderBrandFilters();
-  renderGrid();
   skeletonGrid.style.display = 'none';
   grid.style.display = 'grid';
+  renderGrid();
 }).catch(()=>{
   skeletonGrid.style.display = 'none';
   grid.style.display = 'grid';
