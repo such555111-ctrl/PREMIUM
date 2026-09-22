@@ -549,6 +549,7 @@ def admin_create_product():
         "id": new_id,
         "name": (data.get("name") or "").strip(),
         "category": (data.get("category") or "").strip(),
+        "brand": (data.get("brand") or "").strip(),
         "price": price,
         "old_price": sanitize_old_price(data.get("old_price")),
         "badge": sanitize_badge(data.get("badge")),
@@ -574,6 +575,8 @@ def admin_update_product(pid):
                 p["name"] = (data.get("name") or "").strip()
             if "category" in data:
                 p["category"] = (data.get("category") or "").strip()
+            if "brand" in data:
+                p["brand"] = (data.get("brand") or "").strip()
             if "price" in data:
                 try:
                     p["price"] = int(float(data.get("price") or 0))

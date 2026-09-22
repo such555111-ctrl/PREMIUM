@@ -432,9 +432,18 @@
         <input type="text" id="fCategory" placeholder="Кольца">
       </div>
       <div>
+        <label>Бренд</label>
+        <input type="text" id="fBrand" placeholder="PREMIUM" list="brandSuggestions">
+        <datalist id="brandSuggestions"></datalist>
+      </div>
+    </div>
+
+    <div class="row">
+      <div>
         <label>Цена, ₽</label>
         <input type="number" id="fPrice" placeholder="6990">
       </div>
+      <div></div>
     </div>
 
     <label>Старая цена, ₽ <span class="muted" style="text-transform:none;letter-spacing:0;">— необязательно, покажется зачёркнутой рядом с новой ценой</span></label>
@@ -647,7 +656,15 @@ function updateStats(){
 async function loadProducts(){
   products = await api('/api/admin/products');
   renderList();
+  renderBrandSuggestions();
   updateStats();
+}
+
+function renderBrandSuggestions(){
+  const dl = document.getElementById('brandSuggestions');
+  if (!dl) return;
+  const brands = [...new Set(products.map(p => p.brand).filter(Boolean))].sort();
+  dl.innerHTML = brands.map(b => `<option value="${b}"></option>`).join('');
 }
 
 function renderList(){
@@ -666,7 +683,7 @@ function renderList(){
       <div class="thumb" style="${cover ? `background-image:url('${cover}')` : `background:${SWATCHES[p.swatch % SWATCHES.length]}`}"></div>
       <div class="card-body">
         <div class="card-title">${p.name || '(без названия)'}</div>
-        <div class="card-sub">${p.category || '—'} · ${priceLineHTML(p)}${badgeTag}</div>
+        <div class="card-sub">${p.category || '—'}${p.brand ? ' · ' + p.brand : ''} · ${priceLineHTML(p)}${badgeTag}</div>
         <div class="card-sub">Размеры: ${(p.sizes||[]).join(', ')}</div>
         <div class="card-sub">${photoCount ? `Фото: ${photoCount}` : 'Без фото'}</div>
         <div class="card-actions">
@@ -1051,6 +1068,7 @@ function openModal(id){
   document.getElementById('modalSub').textContent = p ? p.name : 'заполните карточку товара';
   document.getElementById('fName').value = p?.name || '';
   document.getElementById('fCategory').value = p?.category || '';
+  document.getElementById('fBrand').value = p?.brand || '';
   document.getElementById('fPrice').value = p?.price || '';
   document.getElementById('fOldPrice').value = p?.old_price || '';
   document.getElementById('fSizes').value = (p?.sizes||[]).join(', ');
@@ -1137,6 +1155,7 @@ document.getElementById('photoInput').addEventListener('change', async (e) => {
 document.getElementById('saveBtn').onclick = async () => {
   const name = document.getElementById('fName').value.trim();
   const category = document.getElementById('fCategory').value.trim();
+  const brand = document.getElementById('fBrand').value.trim();
   const price = document.getElementById('fPrice').value;
   const oldPrice = document.getElementById('fOldPrice').value;
   const sizes = document.getElementById('fSizes').value;
@@ -1148,7 +1167,7 @@ document.getElementById('saveBtn').onclick = async () => {
     return;
   }
 
-  const payload = { name, category, price, old_price: oldPrice, badge: selectedBadge, sizes, desc, swatch: selectedSwatch, images: uploadedImages };
+  const payload = { name, category, brand, price, old_price: oldPrice, badge: selectedBadge, sizes, desc, swatch: selectedSwatch, images: uploadedImages };
   const btn = document.getElementById('saveBtn');
   btn.disabled = true;
   try {
