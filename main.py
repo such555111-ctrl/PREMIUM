@@ -106,6 +106,111 @@ def save_promos(items):
         json.dump(items, f, ensure_ascii=False, indent=2)
 
 
+
+# --- Хранилище в базе данных (Neon / PostgreSQL) -------------------------
+# Если задана переменная DATABASE_URL, товары, заказы, вопросы и промокоды
+# хранятся в базе и не пропадают при рестарте Render. Без неё — файлы, как раньше.
+
+DATABASE_URL = os.environ.get("DATABASE_URL")
+
+if DATABASE_URL:
+    import psycopg2
+
+    _conn = None
+    _PCACHE = None  # {id: json-строка товара}, чтобы писать в базу только изменённое
+
+    def _db():
+        global _conn
+        if _conn is None or _conn.closed:
+            _conn = psycopg2.connect(DATABASE_URL, connect_timeout=10)
+            _conn.autocommit = True
+        return _conn
+
+    def _run(fn):
+        global _conn
+        for attempt in (1, 2):
+            try:
+                with _db().cursor() as cur:
+                    return fn(cur)
+            except (psycopg2.OperationalError, psycopg2.InterfaceError):
+                try:
+                    _conn.close()
+                except Exception:
+                    pass
+                _conn = None
+                if attempt == 2:
+                    raise
+
+    def _init(cur):
+        cur.execute("CREATE TABLE IF NOT EXISTS products (id integer PRIMARY KEY, data jsonb NOT NULL)")
+        cur.execute("CREATE TABLE IF NOT EXISTS kv (name text PRIMARY KEY, data jsonb NOT NULL)")
+
+    _run(_init)
+
+    def load_products():
+        global _PCACHE
+        if _PCACHE is None:
+            def q(cur):
+                cur.execute("SELECT id, data::text FROM products")
+                return cur.fetchall()
+            _PCACHE = {
+                r[0]: json.dumps(json.loads(r[1]), ensure_ascii=False, sort_keys=True)
+                for r in _run(q)
+            }
+        return [json.loads(_PCACHE[i]) for i in sorted(_PCACHE)]
+
+    def save_products(items):
+        global _PCACHE
+        if _PCACHE is None:
+            load_products()
+        new = {int(p["id"]): json.dumps(p, ensure_ascii=False, sort_keys=True) for p in items}
+        changed = [(i, s) for i, s in new.items() if _PCACHE.get(i) != s]
+        removed = [i for i in _PCACHE if i not in new]
+
+        def w(cur):
+            for i, s in changed:
+                cur.execute(
+                    "INSERT INTO products (id, data) VALUES (%s, %s::jsonb) "
+                    "ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data", (i, s))
+            if removed:
+                cur.execute("DELETE FROM products WHERE id = ANY(%s)", (removed,))
+        _run(w)
+        _PCACHE = new
+
+    def _kv_load(name):
+        def q(cur):
+            cur.execute("SELECT data::text FROM kv WHERE name = %s", (name,))
+            return cur.fetchone()
+        r = _run(q)
+        return json.loads(r[0]) if r else []
+
+    def _kv_save(name, items):
+        def w(cur):
+            cur.execute(
+                "INSERT INTO kv (name, data) VALUES (%s, %s::jsonb) "
+                "ON CONFLICT (name) DO UPDATE SET data = EXCLUDED.data",
+                (name, json.dumps(items, ensure_ascii=False)))
+        _run(w)
+
+    def load_orders(): return _kv_load("orders")
+    def save_orders(items): _kv_save("orders", items)
+    def load_questions(): return _kv_load("questions")
+    def save_questions(items): _kv_save("questions", items)
+    def load_promos(): return _kv_load("promos")
+    def save_promos(items): _kv_save("promos", items)
+
+    # Первый запуск: если база пустая, переносим товары из products.json
+    try:
+        if not load_products() and os.path.exists(PRODUCTS_FILE):
+            with open(PRODUCTS_FILE, "r", encoding="utf-8") as _f:
+                _old = json.load(_f)
+            if _old:
+                save_products(_old)
+                log.info("Перенесено товаров из products.json в базу: %d", len(_old))
+    except Exception as e:
+        log.warning("Не удалось перенести products.json в базу: %s", e)
+
+
 def fmt_price(n):
     return f"{int(n):,}".replace(",", " ") + " ₽"
 
@@ -235,6 +340,163 @@ def cmd_start(message: types.Message):
 
 
 
+# --- Импорт товаров пересылкой постов из канала -------------------------
+# Админ пересылает посты канала боту -> каждый пост (альбом) = один товар.
+# Фото не скачиваются на диск: хранится file_id Telegram, а картинку отдаёт
+# маршрут /tgphoto/<file_id>. Поэтому фото не пропадут при рестарте Render.
+
+import re
+from flask import Response
+
+PRICE_RE = re.compile(r"(\d[\d.,\s]*)\s*(?:₽|руб|р\b)", re.I)
+SKIP_WORDS = ("@", "http", "wa.me", "t.me", "вопрос")
+CATEGORY_WORDS = [
+    ("Кольца", ("кольц",)),
+    ("Серьги", ("серьг", "сережк")),
+    ("Браслеты", ("браслет",)),
+    ("Колье", ("колье", "ожерель", "цепочк", "цепь")),
+    ("Подвески", ("подвес", "кулон")),
+]
+
+
+def _clean_line(s):
+    s = re.sub(r"[^\w\s&.,\-–—/()+'’:]", " ", s or "")
+    return re.sub(r"\s+", " ", s).strip(" -–—:.,")
+
+
+def _guess_category(text):
+    low = (text or "").lower()
+    for cat, words in CATEGORY_WORDS:
+        if any(w in low for w in words):
+            return cat
+    return None
+
+
+def parse_post(text):
+    """Достаёт из текста поста бренд, цену, категорию и описание."""
+    brand = ""
+    prices = []        # (подпись, цена)
+    desc_lines = []
+    for raw in (text or "").splitlines():
+        ln = raw.strip()
+        if not ln:
+            continue
+        low = ln.lower()
+        if any(w in low for w in SKIP_WORDS):
+            continue
+        m = PRICE_RE.search(ln)
+        if m:
+            digits = re.sub(r"\D", "", m.group(1))
+            if digits:
+                prices.append((_clean_line(ln[:m.start()]), int(digits)))
+                desc_lines.append(ln)
+                continue
+        cleaned = _clean_line(ln)
+        if cleaned.lower() in ("цена", "premium", ""):
+            continue
+        if not brand:
+            brand = cleaned
+            continue
+        desc_lines.append(ln)
+
+    labels = []
+    cats = []
+    for label, _ in prices:
+        c = _guess_category(label)
+        if c and c not in cats:
+            cats.append(c)
+        if label and label.lower() not in [x.lower() for x in labels]:
+            labels.append(label)
+    if len(cats) == 1:
+        category = cats[0]
+    elif len(cats) > 1:
+        category = "Комплекты"
+    else:
+        category = _guess_category(text) or "Бижутерия"
+
+    name = brand or "Украшение"
+    if labels:
+        name = f"{name} — {', '.join(labels)}"
+    price = min((p for _, p in prices), default=0)
+    return {
+        "name": name[:120],
+        "brand": brand[:60],
+        "category": category,
+        "price": price,
+        "desc": "\n".join(desc_lines).strip(),
+    }
+
+
+def _origin_key(m):
+    origin = getattr(m, "forward_origin", None)
+    chat = getattr(origin, "chat", None)
+    mid = getattr(origin, "message_id", None)
+    if chat is not None and mid:
+        return f"{chat.id}_{mid}"
+    return None
+
+
+def _is_admin_msg(m):
+    return bool(m.from_user) and m.from_user.id in ADMIN_CHAT_IDS
+
+
+@bot.message_handler(content_types=["photo", "video"], func=_is_admin_msg)
+def import_forwarded(message: types.Message):
+    if not (getattr(message, "forward_origin", None) or getattr(message, "forward_date", None)):
+        return
+    items = load_products()
+    okey = _origin_key(message)
+    if okey and any(okey in (p.get("tg_keys") or []) for p in items):
+        return  # этот пост уже загружен
+
+    gid = str(message.media_group_id) if message.media_group_id else None
+    product = None
+    if gid:
+        product = next((p for p in items if p.get("tg_group") == gid), None)
+    if product is None:
+        new_id = max([p.get("id", 0) for p in items], default=0) + 1
+        product = {
+            "id": new_id, "name": "Украшение", "category": "Бижутерия",
+            "brand": "", "price": 0, "old_price": None, "badge": None,
+            "sizes": ["One size"], "swatch": 0, "desc": "",
+            "images": [], "image": None, "tg_group": gid, "tg_keys": [],
+        }
+        items.append(product)
+
+    if okey:
+        product.setdefault("tg_keys", []).append(okey)
+    if message.photo:
+        url = "/tgphoto/" + message.photo[-1].file_id
+        product["images"].append(url)
+        product["image"] = product["images"][0]
+    if message.caption:
+        product.update(parse_post(message.caption))
+    save_products(items)
+
+
+@bot.message_handler(commands=["count"], func=_is_admin_msg)
+def cmd_count(message: types.Message):
+    items = load_products()
+    no_price = sum(1 for p in items if not p.get("price"))
+    no_photo = sum(1 for p in items if not p.get("images"))
+    bot.send_message(
+        message.chat.id,
+        f"Товаров в каталоге: {len(items)}\nБез цены: {no_price}\nБез фото: {no_photo}"
+    )
+
+
+@app.route("/tgphoto/<path:file_id>", methods=["GET"])
+def tg_photo(file_id):
+    try:
+        info = bot.get_file(file_id)
+        data = bot.download_file(info.file_path)
+    except Exception:
+        abort(404)
+    resp = Response(data, mimetype="image/jpeg")
+    resp.headers["Cache-Control"] = "public, max-age=31536000"
+    return resp
+
+
 @bot.message_handler(func=lambda m: True, content_types=["text"])
 def fallback(message: types.Message):
     cmd_start(message)
@@ -249,7 +511,7 @@ def index():
 
 @app.route("/products.json", methods=["GET"])
 def products():
-    return send_from_directory(APP_DIR, "products.json")
+    return jsonify(load_products())
 
 
 # Сколько товаров отдавать за один запрос каталога по умолчанию / максимум.
